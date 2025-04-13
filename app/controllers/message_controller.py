@@ -1,165 +1,139 @@
-from typing import Optional
+from fastapi import HTTPException, status, Depends, Body
+from typing import Optional, List
 from datetime import datetime
-from fastapi import HTTPException, status
+import uuid
 
-from cassandra.query import SimpleStatement
-from cassandra.util import uuid_from_time
-from uuid import uuid4
+from app.models.cassandra_models import MessageModel
+from app.schemas.message import (
+    MessageCreate,
+    MessageResponse,
+    PaginatedMessageResponse
+)
 
-from app.schemas.message import MessageCreate, MessageResponse, PaginatedMessageResponse
-from app.db import get_db_session
-
-PAGE_SIZE = 20
+UNKNOWN_TOTAL = -1
 
 class MessageController:
     """
-    Controller for handling message operations
+    Controller for handling message operations.
+    Connects API routes to MessageModel methods.
     """
 
     async def send_message(self, message_data: MessageCreate) -> MessageResponse:
         """
-        Send a message from one user to another
+        Send a message from one user to another.
         """
         try:
-            session = get_db_session()
+            conversation_id, message_timeuuid, message_id = await MessageModel.create_message(
+                sender_id=message_data.sender_id,
+                receiver_id=message_data.receiver_id,
+                content=message_data.content
+            )
 
-            conversation_id = message_data.conversation_id
-            message_id = uuid_from_time(datetime.utcnow())
+            if conversation_id is None or message_timeuuid is None or message_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to send message due to internal error."
+                )
 
-            # Save to messages_by_conversation
-            insert_message = """
-            INSERT INTO messages_by_conversation (
-                conversation_id, message_id, sender_id, recipient_id, message_text, timestamp
-            ) VALUES (%s, %s, %s, %s, %s, toTimestamp(now()))
-            """
-            session.execute(insert_message, (
-                conversation_id,
-                message_id,
-                message_data.sender_id,
-                message_data.recipient_id,
-                message_data.message_text,
-            ))
+            msg_timestamp_ns = message_timeuuid.time
+            created_at_dt = datetime.utcfromtimestamp(msg_timestamp_ns / 1e9)
 
-            # Update conversations_by_user for both sender and recipient
-            update_conversations = """
-            INSERT INTO conversations_by_user (
-                user_id, last_message_timestamp, conversation_id, participant_id
-            ) VALUES (%s, toTimestamp(now()), %s, %s)
-            """
-
-            session.execute(update_conversations, (
-                message_data.sender_id,
-                conversation_id,
-                message_data.recipient_id
-            ))
-
-            session.execute(update_conversations, (
-                message_data.recipient_id,
-                conversation_id,
-                message_data.sender_id
-            ))
 
             return MessageResponse(
-                conversation_id=conversation_id,
-                message_id=message_id,
+                id=message_id, # Use the actual message_id returned by the model
                 sender_id=message_data.sender_id,
-                recipient_id=message_data.recipient_id,
-                message_text=message_data.message_text,
-                timestamp=datetime.utcnow()
+                receiver_id=message_data.receiver_id,
+                content=message_data.content,
+                created_at=created_at_dt,
+                conversation_id=conversation_id
             )
+
+        except ValueError as ve: # Catch specific errors like self-conversation
+             raise HTTPException(
+                 status_code=status.HTTP_400_BAD_REQUEST,
+                 detail=str(ve)
+             )
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=str(e)
+                detail="Failed to send message"
             )
 
     async def get_conversation_messages(
         self,
-        conversation_id: str,
+        conversation_id: uuid.UUID,
         page: int = 1,
-        limit: int = PAGE_SIZE
+        limit: int = 20
     ) -> PaginatedMessageResponse:
         """
-        Get all messages in a conversation with pagination
+        Get all messages in a conversation with pagination.
+
+        NOTE: See pagination note in ConversationController.get_user_conversations.
+        This implementation primarily uses 'limit' and doesn't support arbitrary 'page'.
         """
+        if limit <= 0:
+             limit = 20
+
         try:
-            session = get_db_session()
+            messages_data, next_paging_state = await MessageModel.get_conversation_messages(
+                conversation_id=conversation_id,
+                page_size=limit,
+                paging_state=None # For first page
+            )
 
-            offset = (page - 1) * limit
-            query = f"""
-            SELECT * FROM messages_by_conversation
-            WHERE conversation_id = %s
-            LIMIT {offset + limit}
-            """
-
-            rows = session.execute(query, (conversation_id,))
-            all_rows = list(rows)[offset:]
-
-            messages = [
-                MessageResponse(
-                    conversation_id=row.conversation_id,
-                    message_id=row.message_id,
-                    sender_id=row.sender_id,
-                    recipient_id=row.recipient_id,
-                    message_text=row.message_text,
-                    timestamp=row.timestamp
-                ) for row in all_rows
-            ]
+            messages = [MessageResponse.model_validate(data) for data in messages_data]
 
             return PaginatedMessageResponse(
-                messages=messages,
+                total=UNKNOWN_TOTAL,
                 page=page,
-                limit=limit
+                limit=limit,
+                data=messages
+                # Ideally include next_paging_state as next_page_token
             )
+
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=str(e)
+                detail=f"Failed to fetch messages for conversation {conversation_id}"
             )
 
     async def get_messages_before_timestamp(
         self,
-        conversation_id: str,
+        conversation_id: uuid.UUID,
         before_timestamp: datetime,
         page: int = 1,
-        limit: int = PAGE_SIZE
+        limit: int = 20
     ) -> PaginatedMessageResponse:
         """
-        Get messages in a conversation before a specific timestamp with pagination
+        Get messages in a conversation before a specific timestamp with pagination.
+
+        NOTE: See pagination note in ConversationController.get_user_conversations.
+        This implementation primarily uses 'limit' and doesn't support arbitrary 'page'.
         """
+        if limit <= 0:
+             limit = 20
+
         try:
-            session = get_db_session()
+             # Fetch the first page only
+            messages_data, next_paging_state = await MessageModel.get_messages_before_timestamp(
+                conversation_id=conversation_id,
+                before_timestamp=before_timestamp,
+                page_size=limit,
+                paging_state=None # For first page
+            )
 
-            max_uuid = uuid_from_time(before_timestamp)
-            offset = (page - 1) * limit
-
-            query = f"""
-            SELECT * FROM messages_by_conversation
-            WHERE conversation_id = %s AND message_id < %s
-            LIMIT {offset + limit}
-            """
-
-            rows = session.execute(query, (conversation_id, max_uuid))
-            all_rows = list(rows)[offset:]
-
-            messages = [
-                MessageResponse(
-                    conversation_id=row.conversation_id,
-                    message_id=row.message_id,
-                    sender_id=row.sender_id,
-                    recipient_id=row.recipient_id,
-                    message_text=row.message_text,
-                    timestamp=row.timestamp
-                ) for row in all_rows
-            ]
+            messages = [MessageResponse.model_validate(data) for data in messages_data]
 
             return PaginatedMessageResponse(
-                messages=messages,
+                total=UNKNOWN_TOTAL,
                 page=page,
-                limit=limit
+                limit=limit,
+                data=messages
+                 # Ideally include next_paging_state as next_page_token
             )
+
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=str(e)
+                detail=f"Failed to fetch messages before timestamp for conversation {conversation_id}"
             )
