@@ -59,6 +59,27 @@ def create_tables(session):
     # - What tables are needed to implement the required APIs?
     # - What should be the primary keys and clustering columns?
     # - How will you handle pagination and time-based queries?
+    session.execute("""
+    CREATE TABLE IF NOT EXISTS messages_by_conversation (
+        conversation_id UUID,
+        message_id TIMEUUID,
+        sender_id UUID,
+        recipient_id UUID,
+        message_text TEXT,
+        timestamp TIMESTAMP,
+        PRIMARY KEY (conversation_id, message_id)
+    ) WITH CLUSTERING ORDER BY (message_id DESC);
+    """)
+
+    session.execute("""
+    CREATE TABLE IF NOT EXISTS conversations_by_user (
+        user_id UUID,
+        conversation_id UUID,
+        last_message_timestamp TIMESTAMP,
+        participant_id UUID,
+        PRIMARY KEY (user_id, last_message_timestamp, conversation_id)
+    ) WITH CLUSTERING ORDER BY (last_message_timestamp DESC);
+    """)
     
     logger.info("Tables created successfully.")
 
